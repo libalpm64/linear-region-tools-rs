@@ -1,0 +1,64 @@
+[package]
+name = "linear-region-tools-rs"
+version = "1.0.0"
+edition = "2024"
+authors = ["Libalpm"]
+description = "Fastest Linear converter in minecraft."
+
+[[bin]]
+name = "convert_region_files"
+path = "src/bin/convert_region_files.rs"
+
+[[bin]]
+name = "fix_nbt_corruption"
+path = "src/bin/fix_nbt_corruption.rs"
+
+[lib]
+name = "linear_region_tools"
+path = "src/lib.rs"
+
+[profile.dev]
+opt-level = 0
+debug = true
+debug-assertions = true
+overflow-checks = true
+panic = "unwind"
+incremental = true
+codegen-units = 256
+lto = false
+strip = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+debug-assertions = false
+overflow-checks = false
+incremental = false
+
+[profile.bench]
+inherits = "release"
+
+[dependencies]
+fastnbt = "2.6.0"
+fastanvil = "0.32.0"
+rayon = "1.11.0"
+flate2 = "1.1.4"
+zstd = "0.13.3"
+memmap2 = "0.9.8"
+clap = { version = "4.5.48", features = ["derive"] }
+indicatif = { version = "0.18.0", features = ["rayon"] }
+anyhow = "1.0.100"
+thiserror = "2.0.17"
+num_cpus = "1.17"
+smallvec = "1.15.1"
+ahash = "0.8.12"
+bincode = "2.0.1"
+filetime = "0.2.26"
+uuid = { version = "1.11.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"
