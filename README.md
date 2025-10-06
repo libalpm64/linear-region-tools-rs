@@ -42,14 +42,6 @@ fix_nbt_corruption [OPTIONS]
 - `-d, --dry-run`                Dry run: do not make changes, but show the output
 - `-h, --help`                   Print help
 
-### Build Instructions
-
-To compile the NBT Corruption Fixer:
-
-```sh
-cargo build --release --bin fix_nbt_corruption
-```
-
 ---
 
 ## MCA/Linear Converter
@@ -57,7 +49,7 @@ cargo build --release --bin fix_nbt_corruption
 ### Usage
 
 ```sh
-convert_region_files.exe [OPTIONS] <CONVERSION_MODE> <SOURCE_DIR> <DESTINATION_DIR>
+./convert_region_files [OPTIONS] <CONVERSION_MODE> <SOURCE_DIR> <DESTINATION_DIR>
 ```
 
 ### Arguments
@@ -76,8 +68,6 @@ convert_region_files.exe [OPTIONS] <CONVERSION_MODE> <SOURCE_DIR> <DESTINATION_D
 - `-h, --help`
 
 ### Build Instructions
-
-To compile the main converter:
 
 ```sh
 cargo build --release
