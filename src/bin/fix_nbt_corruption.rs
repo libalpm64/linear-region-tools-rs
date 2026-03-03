@@ -4,8 +4,8 @@ use fastnbt::Value;
 use indicatif::{ProgressBar, ProgressStyle};
 use linear_region_tools::{
     anvil::{read_anvil_region, write_anvil_region},
-    linear::{read_linear_region, write_linear_region},
-    Chunk, Region,
+    linear::{read_linear_region, write_linear_region, LinearVersion},
+    Chunk,
 };
 use rayon::prelude::*;
 use std::{
@@ -76,7 +76,7 @@ fn main() -> Result<()> {
         "linear" => "linear",
         _ => return Err(anyhow::anyhow!("Invalid format: {}", args.format)),
     };
-    
+
     let mut files = Vec::new();
     for entry in fs::read_dir(&args.input)? {
         let entry = entry?;
@@ -86,14 +86,14 @@ fn main() -> Result<()> {
         }
     }
     files.sort();
-    
+
     if files.is_empty() {
         println!("No {} files found in {}", args.format, args.input.display());
         return Ok(());
     }
 
     println!("Found {} {} files to process", files.len(), args.format);
-    
+
     if args.dry_run {
         println!("DRY RUN MODE - No files will be modified");
     }
@@ -102,7 +102,7 @@ fn main() -> Result<()> {
     progress.set_style(
         ProgressStyle::default_bar()
             .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
-            .unwrap()
+            .unwrap(),
     );
 
     let total_stats = files
@@ -110,12 +110,16 @@ fn main() -> Result<()> {
         .map(|file_path| {
             let result = fix_region_file(file_path, &args);
             progress.inc(1);
-            
+
             match result {
                 Ok(stats) => {
                     if args.verbose {
-                        progress.println(format!("Fixed {}: {} entities, {} enchantments", 
-                            file_path.display(), stats.entities_fixed, stats.enchantments_fixed));
+                        progress.println(format!(
+                            "Fixed {}: {} entities, {} enchantments",
+                            file_path.display(),
+                            stats.entities_fixed,
+                            stats.enchantments_fixed
+                        ));
                     }
                     stats
                 }
@@ -125,14 +129,17 @@ fn main() -> Result<()> {
                 }
             }
         })
-        .reduce(|| FixStats::default(), |mut acc, stats| {
-            acc.merge(&stats);
-            acc
-        });
+        .reduce(
+            || FixStats::default(),
+            |mut acc, stats| {
+                acc.merge(&stats);
+                acc
+            },
+        );
 
     progress.finish_with_message("Complete!");
 
-    println!("\n=== Fix Summary ===");
+    println!("\nFix Summary:");
     println!("Files processed: {}", total_stats.files_processed);
     println!("Chunks fixed: {}", total_stats.chunks_fixed);
     println!("Entities fixed: {}", total_stats.entities_fixed);
@@ -146,10 +153,12 @@ fn main() -> Result<()> {
 fn fix_region_file(file_path: &Path, args: &Args) -> Result<FixStats> {
     let mut stats = FixStats::default();
     stats.files_processed = 1;
-    
+
     if args.backup && !args.dry_run {
-        let backup_path = file_path.with_extension(format!("{}.backup", 
-            file_path.extension().unwrap().to_str().unwrap()));
+        let backup_path = file_path.with_extension(format!(
+            "{}.backup",
+            file_path.extension().unwrap().to_str().unwrap()
+        ));
         fs::copy(file_path, backup_path)?;
     }
 
@@ -164,13 +173,16 @@ fn fix_region_file(file_path: &Path, args: &Args) -> Result<FixStats> {
 
     for chunk in region.chunks.values_mut() {
         let chunk_stats = fix_chunk(chunk, &mut used_uuids)?;
-        
-        if chunk_stats.entities_fixed > 0 || chunk_stats.enchantments_fixed > 0 || 
-           chunk_stats.uuids_regenerated > 0 || chunk_stats.positions_fixed > 0 {
+
+        if chunk_stats.entities_fixed > 0
+            || chunk_stats.enchantments_fixed > 0
+            || chunk_stats.uuids_regenerated > 0
+            || chunk_stats.positions_fixed > 0
+        {
             region_modified = true;
             stats.chunks_fixed += 1;
         }
-        
+
         stats.merge(&chunk_stats);
     }
 
@@ -183,7 +195,7 @@ fn fix_region_file(file_path: &Path, args: &Args) -> Result<FixStats> {
 
         match args.format.as_str() {
             "mca" => write_anvil_region(&output_path, &region, 6, None)?,
-            "linear" => write_linear_region(&output_path, &region, 3, None)?,
+            "linear" => write_linear_region(&output_path, &region, 3, LinearVersion::V1, None)?,
             _ => unreachable!(),
         }
     }
@@ -192,8 +204,10 @@ fn fix_region_file(file_path: &Path, args: &Args) -> Result<FixStats> {
 }
 
 fn should_delete_entity(entity: &Value) -> bool {
-    let Value::Compound(entity_data) = entity else { return false };
-    
+    let Value::Compound(entity_data) = entity else {
+        return false;
+    };
+
     let has_custom_data = |item: &Value| {
         if let Value::Compound(item_data) = item {
             if let Some(Value::Compound(components)) = item_data.get("components") {
@@ -204,15 +218,19 @@ fn should_delete_entity(entity: &Value) -> bool {
     };
 
     if let Some(Value::Compound(equipment)) = entity_data.get("equipment") {
-        if equipment.values().any(has_custom_data) { return true; }
-    }
-    
-    for field in ["ArmorItems", "HandItems"] {
-        if let Some(Value::List(items)) = entity_data.get(field) {
-            if items.iter().any(has_custom_data) { return true; }
+        if equipment.values().any(has_custom_data) {
+            return true;
         }
     }
-    
+
+    for field in ["ArmorItems", "HandItems"] {
+        if let Some(Value::List(items)) = entity_data.get(field) {
+            if items.iter().any(has_custom_data) {
+                return true;
+            }
+        }
+    }
+
     false
 }
 
@@ -227,17 +245,20 @@ fn fix_chunk(chunk: &mut Chunk, used_uuids: &mut HashSet<String>) -> Result<FixS
             if let Some(Value::List(entities)) = compound.get_mut(entities_field) {
                 let original_count = entities.len();
                 entities.retain(|entity| !should_delete_entity(entity));
-                
+
                 let deleted_count = original_count - entities.len();
                 if deleted_count > 0 {
                     stats.entities_fixed += deleted_count;
                     modified = true;
                 }
-                
+
                 for entity in entities {
                     let entity_stats = fix_entity(entity, chunk.x, chunk.z, used_uuids)?;
-                    if entity_stats.entities_fixed > 0 || entity_stats.enchantments_fixed > 0 || 
-                       entity_stats.uuids_regenerated > 0 || entity_stats.positions_fixed > 0 {
+                    if entity_stats.entities_fixed > 0
+                        || entity_stats.enchantments_fixed > 0
+                        || entity_stats.uuids_regenerated > 0
+                        || entity_stats.positions_fixed > 0
+                    {
                         modified = true;
                     }
                     stats.merge(&entity_stats);
@@ -253,7 +274,12 @@ fn fix_chunk(chunk: &mut Chunk, used_uuids: &mut HashSet<String>) -> Result<FixS
     Ok(stats)
 }
 
-fn fix_entity(entity: &mut Value, chunk_x: i32, chunk_z: i32, used_uuids: &mut HashSet<String>) -> Result<FixStats> {
+fn fix_entity(
+    entity: &mut Value,
+    chunk_x: i32,
+    chunk_z: i32,
+    used_uuids: &mut HashSet<String>,
+) -> Result<FixStats> {
     let mut stats = FixStats::default();
 
     if let Value::Compound(entity_data) = entity {
@@ -297,8 +323,11 @@ fn fix_entity(entity: &mut Value, chunk_x: i32, chunk_z: i32, used_uuids: &mut H
             for passenger in passengers {
                 let passenger_stats = fix_entity(passenger, chunk_x, chunk_z, used_uuids)?;
                 stats.merge(&passenger_stats);
-                if passenger_stats.entities_fixed > 0 || passenger_stats.enchantments_fixed > 0 || 
-                   passenger_stats.uuids_regenerated > 0 || passenger_stats.positions_fixed > 0 {
+                if passenger_stats.entities_fixed > 0
+                    || passenger_stats.enchantments_fixed > 0
+                    || passenger_stats.uuids_regenerated > 0
+                    || passenger_stats.positions_fixed > 0
+                {
                     entity_modified = true;
                 }
             }
@@ -351,11 +380,12 @@ fn fix_item_enchantments(item: &mut Value) -> Result<FixStats> {
                 }
             }
 
-            if let Some(Value::Compound(custom_data)) = components.get_mut("minecraft:custom_data") {
+            if let Some(Value::Compound(custom_data)) = components.get_mut("minecraft:custom_data")
+            {
                 if custom_data.remove("VV|Protocol1_20_3To1_20_5").is_some() {
                     stats.enchantments_fixed += 1;
                 }
-                
+
                 if let Some(Value::List(enchantments)) = custom_data.get_mut("Enchantments") {
                     for enchant in enchantments {
                         if let Value::Compound(enchant_data) = enchant {
@@ -390,7 +420,7 @@ fn fix_item_enchantments(item: &mut Value) -> Result<FixStats> {
 
 fn fix_enchantment_levels(enchant_map: &mut HashMap<String, Value>) -> usize {
     let mut fixed_count = 0;
-    
+
     for (_enchant_name, level) in enchant_map.iter_mut() {
         match level {
             Value::Int(lvl) => {
@@ -416,7 +446,7 @@ fn fix_enchantment_levels(enchant_map: &mut HashMap<String, Value>) -> usize {
             }
         }
     }
-    
+
     fixed_count
 }
 
@@ -427,10 +457,10 @@ fn fix_entity_uuid(uuid_value: &mut Value, used_uuids: &mut HashSet<String>) -> 
         Value::String(s) => s.clone(),
         Value::IntArray(arr) if arr.len() == 4 => {
             let uuid = Uuid::from_u128(
-                ((arr[0] as u128) << 96) |
-                ((arr[1] as u128) << 64) |
-                ((arr[2] as u128) << 32) |
-                (arr[3] as u128)
+                ((arr[0] as u128) << 96)
+                    | ((arr[1] as u128) << 64)
+                    | ((arr[2] as u128) << 32)
+                    | (arr[3] as u128),
             );
             uuid.to_string()
         }
@@ -440,7 +470,7 @@ fn fix_entity_uuid(uuid_value: &mut Value, used_uuids: &mut HashSet<String>) -> 
     if used_uuids.contains(&uuid_str) {
         let new_uuid = Uuid::new_v4();
         let new_uuid_str = new_uuid.to_string();
-        
+
         match uuid_value {
             Value::String(s) => *s = new_uuid_str.clone(),
             Value::IntArray(arr) => {
@@ -452,7 +482,7 @@ fn fix_entity_uuid(uuid_value: &mut Value, used_uuids: &mut HashSet<String>) -> 
             }
             _ => {}
         }
-        
+
         used_uuids.insert(new_uuid_str);
         stats.uuids_regenerated += 1;
     } else {

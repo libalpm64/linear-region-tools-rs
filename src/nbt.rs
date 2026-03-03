@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
 
-pub use fastnbt::{Value, from_bytes, to_bytes, from_reader, to_writer};
+pub use fastnbt::{from_bytes, from_reader, to_bytes, to_writer, Value};
 
 #[inline]
 pub fn parse_nbt(data: &[u8]) -> Result<Value> {

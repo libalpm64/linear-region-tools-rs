@@ -35,7 +35,12 @@ impl ChunkLocation {
     }
 
     fn to_bytes(&self) -> [u8; Self::SIZE] {
-        [self.offset[0], self.offset[1], self.offset[2], self.sector_count]
+        [
+            self.offset[0],
+            self.offset[1],
+            self.offset[2],
+            self.sector_count,
+        ]
     }
 
     fn get_offset(&self) -> u32 {
@@ -87,15 +92,16 @@ pub fn read_anvil_region<P: AsRef<Path>>(
     counters: Option<Arc<PerformanceCounters>>,
 ) -> Result<Region> {
     let path = path.as_ref();
-    
-    let filename = path.file_name()
+
+    let filename = path
+        .file_name()
         .and_then(|n| n.to_str())
         .context("Invalid filename")?;
     let (region_x, region_z) = Region::parse_filename(filename)?;
 
     let mmap = io_utils::mmap_file(path)?;
     let file_size = mmap.len();
-    
+
     if let Some(ref counters) = counters {
         counters.add_bytes_read(file_size as u64);
     }
@@ -119,13 +125,17 @@ pub fn read_anvil_region<P: AsRef<Path>>(
         let start = SECTOR_SIZE + i * 4;
         let _end = start + 4;
         let timestamp = u32::from_be_bytes([
-            mmap[start], mmap[start + 1], mmap[start + 2], mmap[start + 3]
+            mmap[start],
+            mmap[start + 1],
+            mmap[start + 2],
+            mmap[start + 3],
         ]);
         timestamps.push(timestamp);
     }
 
     let mut region = Region::new(region_x, region_z);
-    region.mtime = std::fs::metadata(path)?.modified()?
+    region.mtime = std::fs::metadata(path)?
+        .modified()?
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
     region.timestamps.extend_from_slice(&timestamps);
@@ -140,27 +150,27 @@ pub fn read_anvil_region<P: AsRef<Path>>(
 
         let sector_offset = location.get_offset() as usize;
         let sector_count = location.sector_count as usize;
-        
+
         if sector_offset == 0 || sector_count == 0 {
             continue;
         }
 
         let chunk_start = sector_offset * SECTOR_SIZE;
         let chunk_end = chunk_start + sector_count * SECTOR_SIZE;
-        
+
         if chunk_end > file_size {
             continue;
         }
 
         let chunk_data = &mmap[chunk_start..chunk_end];
-        
+
         if chunk_data.len() < ChunkDataHeader::SIZE {
             continue;
         }
 
         let header = ChunkDataHeader::from_bytes(&chunk_data[..ChunkDataHeader::SIZE]);
         let compressed_data = &chunk_data[ChunkDataHeader::SIZE..];
-        
+
         let chunk_x = region_x * REGION_DIMENSION as i32 + (i % REGION_DIMENSION) as i32;
         let chunk_z = region_z * REGION_DIMENSION as i32 + (i / REGION_DIMENSION) as i32;
 
@@ -169,18 +179,21 @@ pub fn read_anvil_region<P: AsRef<Path>>(
                 let data_length = std::cmp::min(header.length as usize, compressed_data.len());
                 let mut decoder = ZlibDecoder::new(&compressed_data[..data_length]);
                 let mut decompressed = Vec::new();
-                decoder.read_to_end(&mut decompressed)
+                decoder
+                    .read_to_end(&mut decompressed)
                     .context("Failed to decompress zlib chunk")?;
                 decompressed
             }
             EXTERNAL_FILE_COMPRESSION_TYPE => {
                 let external_path = source_dir.join(format!("c.{}.{}.mcc", chunk_x, chunk_z));
-                let external_mmap = io_utils::mmap_file(&external_path)
-                    .with_context(|| format!("Failed to read external file: {:?}", external_path))?;
-                
+                let external_mmap = io_utils::mmap_file(&external_path).with_context(|| {
+                    format!("Failed to read external file: {:?}", external_path)
+                })?;
+
                 let mut decoder = ZlibDecoder::new(&external_mmap[..]);
                 let mut decompressed = Vec::new();
-                decoder.read_to_end(&mut decompressed)
+                decoder
+                    .read_to_end(&mut decompressed)
                     .context("Failed to decompress external chunk")?;
                 decompressed
             }
@@ -218,19 +231,21 @@ pub fn write_anvil_region<P: AsRef<Path>>(
     for i in 0..CHUNKS_PER_REGION {
         if let Some(chunk) = region.get_chunk(i) {
             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(compression_level));
-            encoder.write_all(chunk.as_slice())
+            encoder
+                .write_all(chunk.as_slice())
                 .context("Failed to write chunk data to compressor")?;
-            let compressed = encoder.finish()
-                .context("Failed to compress chunk data")?;
+            let compressed = encoder.finish().context("Failed to compress chunk data")?;
 
             let data_size = ChunkDataHeader::SIZE + compressed.len();
             let sectors_needed = (data_size + SECTOR_SIZE - 1) / SECTOR_SIZE;
 
             if sectors_needed > 255 {
-                let chunk_x = region.region_x * REGION_DIMENSION as i32 + (i % REGION_DIMENSION) as i32;
-                let chunk_z = region.region_z * REGION_DIMENSION as i32 + (i / REGION_DIMENSION) as i32;
+                let chunk_x =
+                    region.region_x * REGION_DIMENSION as i32 + (i % REGION_DIMENSION) as i32;
+                let chunk_z =
+                    region.region_z * REGION_DIMENSION as i32 + (i / REGION_DIMENSION) as i32;
                 let external_path = destination_dir.join(format!("c.{}.{}.mcc", chunk_x, chunk_z));
-                
+
                 io_utils::atomic_write(&external_path, &compressed)?;
                 io_utils::set_mtime(&external_path, region.mtime)?;
 
@@ -243,16 +258,20 @@ pub fn write_anvil_region<P: AsRef<Path>>(
                 sector_data.extend_from_slice(&sector_chunk);
                 current_sector += 1;
             } else {
-                let header = ChunkDataHeader::new(compressed.len() as u32 + 1, COMPRESSION_TYPE_ZLIB);
+                let header =
+                    ChunkDataHeader::new(compressed.len() as u32 + 1, COMPRESSION_TYPE_ZLIB);
                 let mut sector_chunk = Vec::with_capacity(sectors_needed * SECTOR_SIZE);
-                
+
                 sector_chunk.extend_from_slice(&header.to_bytes());
                 sector_chunk.extend_from_slice(&compressed);
-                
+
                 let padding = sectors_needed * SECTOR_SIZE - sector_chunk.len();
                 sector_chunk.resize(sector_chunk.len() + padding, 0);
 
-                chunk_locations.push(ChunkLocation::new(current_sector as u32, sectors_needed as u8));
+                chunk_locations.push(ChunkLocation::new(
+                    current_sector as u32,
+                    sectors_needed as u8,
+                ));
                 sector_data.extend_from_slice(&sector_chunk);
                 current_sector += sectors_needed;
             }
@@ -276,7 +295,7 @@ pub fn write_anvil_region<P: AsRef<Path>>(
     file_data.extend_from_slice(&sector_data);
 
     io_utils::atomic_write(path, &file_data)?;
-    
+
     io_utils::set_mtime(path, region.mtime)?;
 
     if let Some(ref counters) = counters {
@@ -296,10 +315,10 @@ pub fn region_to_anvil_bytes(region: &Region, compression_level: u32) -> Result<
     for i in 0..CHUNKS_PER_REGION {
         if let Some(chunk) = region.get_chunk(i) {
             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(compression_level));
-            encoder.write_all(chunk.as_slice())
+            encoder
+                .write_all(chunk.as_slice())
                 .context("Failed to write chunk data to compressor")?;
-            let compressed = encoder.finish()
-                .context("Failed to compress chunk data")?;
+            let compressed = encoder.finish().context("Failed to compress chunk data")?;
 
             let data_size = ChunkDataHeader::SIZE + compressed.len();
             let sectors_needed = (data_size + SECTOR_SIZE - 1) / SECTOR_SIZE;
@@ -310,14 +329,17 @@ pub fn region_to_anvil_bytes(region: &Region, compression_level: u32) -> Result<
 
             let header = ChunkDataHeader::new(compressed.len() as u32 + 1, COMPRESSION_TYPE_ZLIB);
             let mut sector_chunk = Vec::with_capacity(sectors_needed * SECTOR_SIZE);
-            
+
             sector_chunk.extend_from_slice(&header.to_bytes());
             sector_chunk.extend_from_slice(&compressed);
-            
+
             let padding = sectors_needed * SECTOR_SIZE - sector_chunk.len();
             sector_chunk.resize(sector_chunk.len() + padding, 0);
 
-            chunk_locations.push(ChunkLocation::new(current_sector as u32, sectors_needed as u8));
+            chunk_locations.push(ChunkLocation::new(
+                current_sector as u32,
+                sectors_needed as u8,
+            ));
             sector_data.extend_from_slice(&sector_chunk);
             current_sector += sectors_needed;
         } else {

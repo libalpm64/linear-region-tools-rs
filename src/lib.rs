@@ -17,7 +17,8 @@ pub const REGION_DIMENSION: usize = 32;
 pub const CHUNKS_PER_REGION: usize = REGION_DIMENSION * REGION_DIMENSION;
 pub const SECTOR_SIZE: usize = 4096;
 pub const LINEAR_SIGNATURE: u64 = 0xc3ff13183cca9d9a;
-pub const LINEAR_VERSION: u8 = 1;
+pub const LINEAR_VERSION_V1: u8 = 1;
+pub const LINEAR_VERSION_V2: u8 = 2;
 pub const COMPRESSION_TYPE_ZLIB: u8 = 2;
 pub const EXTERNAL_FILE_COMPRESSION_TYPE: u8 = 128 + 2;
 type ChunkData = SmallVec<[u8; 8192]>;
@@ -26,22 +27,22 @@ type ChunkData = SmallVec<[u8; 8192]>;
 pub enum RegionError {
     #[error("Invalid signature: expected {expected:#x}, found {found:#x}")]
     InvalidSignature { expected: u64, found: u64 },
-    
+
     #[error("Unsupported version: {version}")]
     UnsupportedVersion { version: u8 },
-    
+
     #[error("Invalid chunk count: expected {expected}, found {found}")]
     InvalidChunkCount { expected: u16, found: u16 },
-    
+
     #[error("Decompression failed: {reason}")]
     DecompressionFailed { reason: String },
-    
+
     #[error("Compression failed: {reason}")]
     CompressionFailed { reason: String },
-    
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     #[error("Invalid file format")]
     InvalidFormat,
 }
@@ -157,12 +158,14 @@ impl Region {
         if parts.len() < 3 {
             return Err(RegionError::InvalidFormat.into());
         }
-        
-        let region_x = parts[1].parse::<i32>()
+
+        let region_x = parts[1]
+            .parse::<i32>()
             .context("Invalid region X coordinate")?;
-        let region_z = parts[2].parse::<i32>()
+        let region_z = parts[2]
+            .parse::<i32>()
             .context("Invalid region Z coordinate")?;
-        
+
         Ok((region_x, region_z))
     }
 }
@@ -237,20 +240,20 @@ pub mod io_utils {
     pub fn atomic_write<P: AsRef<Path>>(path: P, data: &[u8]) -> Result<()> {
         let path = path.as_ref();
         let temp_path = path.with_extension("tmp");
-        
+
         {
             let mut file = BufWriter::new(
                 OpenOptions::new()
                     .write(true)
                     .create(true)
                     .truncate(true)
-                    .open(&temp_path)?
+                    .open(&temp_path)?,
             );
             file.write_all(data)?;
             file.flush()?;
             file.into_inner()?.sync_all()?;
         }
-        
+
         std::fs::rename(temp_path, path)?;
         Ok(())
     }

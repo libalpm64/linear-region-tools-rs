@@ -1,30 +1,42 @@
 use crate::{
-    io_utils, Chunk, PerformanceCounters, Region, RegionError, CHUNKS_PER_REGION,
-    LINEAR_SIGNATURE, LINEAR_VERSION, REGION_DIMENSION,
+    io_utils, Chunk, PerformanceCounters, Region, RegionError, CHUNKS_PER_REGION, LINEAR_SIGNATURE,
+    LINEAR_VERSION_V1, LINEAR_VERSION_V2, REGION_DIMENSION,
 };
 use anyhow::{Context, Result};
-use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use zstd;
 
+#[derive(Debug, Clone, Copy)]
+pub enum LinearVersion {
+    V1,
+    V2,
+}
+
+impl LinearVersion {
+    fn as_u8(&self) -> u8 {
+        match self {
+            LinearVersion::V1 => LINEAR_VERSION_V1,
+            LinearVersion::V2 => LINEAR_VERSION_V2,
+        }
+    }
+}
+
 fn decompress_with_retry(compressed_data: &[u8], header: &LinearHeader) -> Result<Vec<u8>> {
-    let mut last_error = String::new();
-    
     match zstd::bulk::decompress(compressed_data, 0) {
         Ok(data) => return Ok(data),
-        Err(e) => last_error = format!("Standard decompression failed: {}", e),
+        Err(_) => {}
     }
 
     match zstd::bulk::decompress(compressed_data, 64 * 1024 * 1024) {
         Ok(data) => return Ok(data),
-        Err(e) => last_error = format!("Limited decompression failed: {}", e),
+        Err(_) => {}
     }
 
     let estimated_size = (header.chunk_count as usize) * 1024 * 16;
     match zstd::bulk::decompress(compressed_data, estimated_size) {
         Ok(data) => return Ok(data),
-        Err(e) => last_error = format!("Estimated size decompression failed: {}", e),
+        Err(_) => {}
     }
 
     match zstd::stream::Decoder::new(compressed_data) {
@@ -32,32 +44,47 @@ fn decompress_with_retry(compressed_data: &[u8], header: &LinearHeader) -> Resul
             let mut decompressed = Vec::new();
             match std::io::copy(&mut decoder, &mut decompressed) {
                 Ok(_) => return Ok(decompressed),
-                Err(e) => last_error = format!("Streaming decompression failed: {}", e),
+                Err(e) => {
+                    return Err(RegionError::DecompressionFailed {
+                        reason: format!("Streaming decompression failed: {}", e),
+                    }
+                    .into())
+                }
             }
         }
-        Err(e) => last_error = format!("Streaming decoder creation failed: {}", e),
+        Err(e) => {
+            return Err(RegionError::DecompressionFailed {
+                reason: format!("Streaming decoder creation failed: {}", e),
+            }
+            .into())
+        }
     }
-    Err(RegionError::DecompressionFailed { reason: last_error }.into())
 }
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 struct LinearHeader {
-    signature: u64,           // 8 bytes - LINEAR_SIGNATURE
-    version: u8,              // 1 byte - LINEAR_VERSION
-    newest_timestamp: u64,    // 8 bytes - newest chunk timestamp
-    compression_level: i8,    // 1 byte - ZSTD compression level
-    chunk_count: u16,         // 2 bytes - number of chunks in region
-    compressed_size: u32,     // 4 bytes - size of compressed data
+    signature: u64,        // 8 bytes - LINEAR_SIGNATURE
+    version: u8,           // 1 byte - LINEAR_VERSION
+    newest_timestamp: u64, // 8 bytes - newest chunk timestamp
+    compression_level: i8, // 1 byte - ZSTD compression level
+    chunk_count: u16,      // 2 bytes - number of chunks in region
+    compressed_size: u32,  // 4 bytes - size of compressed data
 }
 
 impl LinearHeader {
     const SIZE: usize = 24;
 
-    fn new(newest_timestamp: u64, compression_level: i8, chunk_count: u16, compressed_size: u32) -> Self {
+    fn new(
+        newest_timestamp: u64,
+        compression_level: i8,
+        chunk_count: u16,
+        compressed_size: u32,
+        version: LinearVersion,
+    ) -> Self {
         Self {
             signature: LINEAR_SIGNATURE,
-            version: LINEAR_VERSION,
+            version: version.as_u8(),
             newest_timestamp,
             compression_level,
             chunk_count,
@@ -132,15 +159,16 @@ pub fn read_linear_region<P: AsRef<Path>>(
     counters: Option<Arc<PerformanceCounters>>,
 ) -> Result<Region> {
     let path = path.as_ref();
-    
-    let filename = path.file_name()
+
+    let filename = path
+        .file_name()
         .and_then(|n| n.to_str())
         .context("Invalid filename")?;
     let (region_x, region_z) = Region::parse_filename(filename)?;
 
     let mmap = io_utils::mmap_file(path)?;
     let file_size = mmap.len();
-    
+
     if let Some(ref counters) = counters {
         counters.add_bytes_read(file_size as u64);
     }
@@ -150,18 +178,20 @@ pub fn read_linear_region<P: AsRef<Path>>(
     }
 
     let header = LinearHeader::from_bytes(&mmap[..LinearHeader::SIZE])?;
-    
+
     if header.signature != LINEAR_SIGNATURE {
         return Err(RegionError::InvalidSignature {
             expected: LINEAR_SIGNATURE,
             found: header.signature,
-        }.into());
+        }
+        .into());
     }
 
     if header.version != 1 && header.version != 2 {
         return Err(RegionError::UnsupportedVersion {
             version: header.version,
-        }.into());
+        }
+        .into());
     }
 
     let footer_start = file_size - 8;
@@ -180,7 +210,8 @@ pub fn read_linear_region<P: AsRef<Path>>(
         return Err(RegionError::InvalidSignature {
             expected: LINEAR_SIGNATURE,
             found: footer_signature,
-        }.into());
+        }
+        .into());
     }
 
     let compressed_start = LinearHeader::SIZE + 8;
@@ -201,12 +232,12 @@ pub fn read_linear_region<P: AsRef<Path>>(
         let meta_start = i * ChunkMeta::SIZE;
         let meta_end = meta_start + ChunkMeta::SIZE;
         let meta = ChunkMeta::from_bytes(&decompressed[meta_start..meta_end]);
-        
+
         if meta.size > 0 {
             real_chunk_count += 1;
             total_chunk_size += meta.size as usize;
         }
-        
+
         chunk_metas.push(meta);
     }
 
@@ -214,7 +245,8 @@ pub fn read_linear_region<P: AsRef<Path>>(
         return Err(RegionError::InvalidChunkCount {
             expected: header.chunk_count,
             found: real_chunk_count,
-        }.into());
+        }
+        .into());
     }
 
     if expected_header_size + total_chunk_size != decompressed.len() {
@@ -222,26 +254,27 @@ pub fn read_linear_region<P: AsRef<Path>>(
     }
 
     let mut region = Region::new(region_x, region_z);
-    region.mtime = std::fs::metadata(path)?.modified()?
+    region.mtime = std::fs::metadata(path)?
+        .modified()?
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
 
     let mut chunk_data_offset = expected_header_size;
-    
+
     for (i, meta) in chunk_metas.iter().enumerate() {
         region.timestamps[i] = meta.timestamp;
-        
+
         if meta.size > 0 {
             let chunk_start = chunk_data_offset;
             let chunk_end = chunk_start + meta.size as usize;
             let chunk_data = &decompressed[chunk_start..chunk_end];
-            
+
             let x = region_x * REGION_DIMENSION as i32 + (i % REGION_DIMENSION) as i32;
             let z = region_z * REGION_DIMENSION as i32 + (i / REGION_DIMENSION) as i32;
-            
+
             let chunk = Chunk::from_slice(chunk_data, x, z);
             region.set_chunk(i, chunk, meta.timestamp);
-            
+
             chunk_data_offset = chunk_end;
         }
     }
@@ -258,6 +291,7 @@ pub fn write_linear_region<P: AsRef<Path>>(
     path: P,
     region: &Region,
     compression_level: i32,
+    version: LinearVersion,
     counters: Option<Arc<PerformanceCounters>>,
 ) -> Result<()> {
     let path = path.as_ref();
@@ -271,20 +305,22 @@ pub fn write_linear_region<P: AsRef<Path>>(
         if let Some(chunk) = region.get_chunk(i) {
             let size = chunk.size() as u32;
             let timestamp = region.timestamps[i];
-            
+
             chunk_metas.push(ChunkMeta { size, timestamp });
             chunk_data.extend_from_slice(chunk.as_slice());
-            
+
             newest_timestamp = newest_timestamp.max(timestamp);
             chunk_count += 1;
         } else {
-            chunk_metas.push(ChunkMeta { size: 0, timestamp: region.timestamps[i] });
+            chunk_metas.push(ChunkMeta {
+                size: 0,
+                timestamp: region.timestamps[i],
+            });
         }
     }
 
-    let mut decompressed = Vec::with_capacity(
-        CHUNKS_PER_REGION * ChunkMeta::SIZE + chunk_data.len()
-    );
+    let mut decompressed =
+        Vec::with_capacity(CHUNKS_PER_REGION * ChunkMeta::SIZE + chunk_data.len());
 
     for meta in &chunk_metas {
         decompressed.extend_from_slice(&meta.to_bytes());
@@ -292,29 +328,31 @@ pub fn write_linear_region<P: AsRef<Path>>(
 
     decompressed.extend_from_slice(&chunk_data);
 
-    let compressed = zstd::bulk::compress(&decompressed, compression_level)
-        .map_err(|e| RegionError::CompressionFailed { reason: format!("ZSTD compression failed: {}", e) })?;
+    let compressed = zstd::bulk::compress(&decompressed, compression_level).map_err(|e| {
+        RegionError::CompressionFailed {
+            reason: format!("ZSTD compression failed: {}", e),
+        }
+    })?;
 
     let header = LinearHeader::new(
         newest_timestamp as u64,
         compression_level as i8,
         chunk_count,
         compressed.len() as u32,
+        version,
     );
 
-    let mut file_data = Vec::with_capacity(
-        LinearHeader::SIZE + 8 + compressed.len() + 8
-    );
+    let mut file_data = Vec::with_capacity(LinearHeader::SIZE + 8 + compressed.len() + 8);
     file_data.extend_from_slice(&header.to_bytes());
-    
+
     file_data.extend_from_slice(&[0u8; 8]);
-    
+
     file_data.extend_from_slice(&compressed);
-    
+
     file_data.extend_from_slice(&LINEAR_SIGNATURE.to_be_bytes());
 
     io_utils::atomic_write(path, &file_data)?;
-    
+
     io_utils::set_mtime(path, region.mtime)?;
 
     if let Some(ref counters) = counters {

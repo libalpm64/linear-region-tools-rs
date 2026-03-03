@@ -1,6 +1,6 @@
 # linear-region-tools-rs
 
-Linear Regions Tools is the fastest linear converter for Minecraft. It can quickly convert huge worlds from MCA to linear format, or from linear back to MCA. The code is modular, allowing you to switch compression algorithms—such as from ZSTD to GZIP—by simply modifying the `flate2` compression backend. It's simple, fast, and saves a lot of disk space.
+Linear Regions Tools is the fastest linear converter for Minecraft. It can quickly convert huge worlds from MCA to Linear format (LinearV1 for Foldenor, LinearV2 for Luminol), or from Linear back to MCA.
 
 ## Benchmarks
 
@@ -54,9 +54,15 @@ fix_nbt_corruption [OPTIONS]
 
 ### Arguments
 
-- `<CONVERSION_MODE>` — `mca2linear` or `linear2mca`
+- `<CONVERSION_MODE>` — `mca2linearv1`, `linearv12mca`, `mca2linearv2`, or `linearv2mca`
 - `<SOURCE_DIR>`
 - `<DESTINATION_DIR>`
+
+**Conversion Modes:**
+- `mca2linearv1` — Convert MCA to LinearV1 (Foldenor format)
+- `linearv12mca` — Convert LinearV1 to MCA
+- `mca2linearv2` — Convert MCA to LinearV2 (Luminol format)
+- `linearv2mca` — Convert LinearV2 to MCA
 
 ### Options
 
