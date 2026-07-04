@@ -105,7 +105,6 @@ fn convert_file(
         ConversionMode::Mca2linearv1 | ConversionMode::Mca2linearv2 => {
             let region = read_anvil_region(source_path, None)?;
             if verify {
-                // Verify chunks can be read
                 for i in 0..1024 {
                     let _ = region.get_chunk(i);
                 }
@@ -179,9 +178,7 @@ fn main() -> Result<()> {
         ) {
             Ok(_) => stats.add_converted(1),
             Err(e) => {
-                if args.log {
-                    eprintln!("Error converting {}: {}", source_filename, e);
-                }
+                progress.println(format!("Error converting {}: {:#}", source_filename, e));
                 stats.add_errors(1);
             }
         }

@@ -19,7 +19,10 @@ pub const SECTOR_SIZE: usize = 4096;
 pub const LINEAR_SIGNATURE: u64 = 0xc3ff13183cca9d9a;
 pub const LINEAR_VERSION_V1: u8 = 1;
 pub const LINEAR_VERSION_V2: u8 = 2;
+pub const COMPRESSION_TYPE_GZIP: u8 = 1;
 pub const COMPRESSION_TYPE_ZLIB: u8 = 2;
+pub const COMPRESSION_TYPE_NONE: u8 = 3;
+pub const COMPRESSION_TYPE_LZ4: u8 = 4;
 pub const EXTERNAL_FILE_COMPRESSION_TYPE: u8 = 128 + 2;
 type ChunkData = SmallVec<[u8; 8192]>;
 
@@ -45,6 +48,9 @@ pub enum RegionError {
 
     #[error("Invalid file format")]
     InvalidFormat,
+
+    #[error("Unsupported chunk compression type {compression_type} at chunk ({x}, {z})")]
+    UnsupportedCompression { compression_type: u8, x: i32, z: i32 },
 }
 
 #[derive(Clone)]

@@ -1,9 +1,14 @@
 use crate::{
     io_utils, Chunk, PerformanceCounters, Region, RegionError, CHUNKS_PER_REGION,
-    COMPRESSION_TYPE_ZLIB, EXTERNAL_FILE_COMPRESSION_TYPE, REGION_DIMENSION, SECTOR_SIZE,
+    COMPRESSION_TYPE_GZIP, COMPRESSION_TYPE_LZ4, COMPRESSION_TYPE_NONE, COMPRESSION_TYPE_ZLIB,
+    EXTERNAL_FILE_COMPRESSION_TYPE, REGION_DIMENSION, SECTOR_SIZE,
 };
 use anyhow::{Context, Result};
-use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
+use flate2::{
+    read::{GzDecoder, ZlibDecoder},
+    write::ZlibEncoder,
+    Compression,
+};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -87,6 +92,70 @@ impl ChunkDataHeader {
     }
 }
 
+fn decompress_lz4_block_stream(mut data: &[u8]) -> Result<Vec<u8>> {
+    const MAGIC: &[u8; 8] = b"LZ4Block";
+    const HEADER_LEN: usize = 8 + 1 + 4 + 4 + 4;
+    const METHOD_RAW: u8 = 0x10;
+    const METHOD_LZ4: u8 = 0x20;
+
+    let mut out = Vec::new();
+    loop {
+        if data.len() < HEADER_LEN {
+            // Tolerate a missing end-marker block at the end of the sector padding
+            if out.is_empty() {
+                return Err(RegionError::DecompressionFailed {
+                    reason: "LZ4 block stream truncated".to_string(),
+                }
+                .into());
+            }
+            return Ok(out);
+        }
+        if &data[..8] != MAGIC {
+            if out.is_empty() {
+                return Err(RegionError::DecompressionFailed {
+                    reason: "LZ4 block stream magic mismatch".to_string(),
+                }
+                .into());
+            }
+            return Ok(out);
+        }
+        let token = data[8];
+        let compressed_len =
+            u32::from_le_bytes([data[9], data[10], data[11], data[12]]) as usize;
+        let decompressed_len =
+            u32::from_le_bytes([data[13], data[14], data[15], data[16]]) as usize;
+
+        if decompressed_len == 0 {
+            return Ok(out);
+        }
+        if data.len() < HEADER_LEN + compressed_len {
+            return Err(RegionError::DecompressionFailed {
+                reason: "LZ4 block payload truncated".to_string(),
+            }
+            .into());
+        }
+        let payload = &data[HEADER_LEN..HEADER_LEN + compressed_len];
+
+        match token & 0xf0 {
+            METHOD_RAW => out.extend_from_slice(payload),
+            METHOD_LZ4 => {
+                let decompressed = lz4_flex::block::decompress(payload, decompressed_len)
+                    .map_err(|e| RegionError::DecompressionFailed {
+                        reason: format!("LZ4 block decompression failed: {}", e),
+                    })?;
+                out.extend_from_slice(&decompressed);
+            }
+            method => {
+                return Err(RegionError::DecompressionFailed {
+                    reason: format!("Unknown LZ4 block method: {:#x}", method),
+                }
+                .into())
+            }
+        }
+        data = &data[HEADER_LEN + compressed_len..];
+    }
+}
+
 pub fn read_anvil_region<P: AsRef<Path>>(
     path: P,
     counters: Option<Arc<PerformanceCounters>>,
@@ -138,7 +207,7 @@ pub fn read_anvil_region<P: AsRef<Path>>(
         .modified()?
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-    region.timestamps.extend_from_slice(&timestamps);
+    region.timestamps.copy_from_slice(&timestamps);
 
     let source_dir = path.parent().unwrap_or_else(|| Path::new("."));
 
@@ -174,16 +243,31 @@ pub fn read_anvil_region<P: AsRef<Path>>(
         let chunk_x = region_x * REGION_DIMENSION as i32 + (i % REGION_DIMENSION) as i32;
         let chunk_z = region_z * REGION_DIMENSION as i32 + (i / REGION_DIMENSION) as i32;
 
+        let data_length = std::cmp::min(
+            (header.length as usize).saturating_sub(1),
+            compressed_data.len(),
+        );
+        let payload = &compressed_data[..data_length];
+
         let nbt_data = match header.compression_type {
             COMPRESSION_TYPE_ZLIB => {
-                let data_length = std::cmp::min(header.length as usize, compressed_data.len());
-                let mut decoder = ZlibDecoder::new(&compressed_data[..data_length]);
+                let mut decoder = ZlibDecoder::new(payload);
                 let mut decompressed = Vec::new();
                 decoder
                     .read_to_end(&mut decompressed)
                     .context("Failed to decompress zlib chunk")?;
                 decompressed
             }
+            COMPRESSION_TYPE_GZIP => {
+                let mut decoder = GzDecoder::new(payload);
+                let mut decompressed = Vec::new();
+                decoder
+                    .read_to_end(&mut decompressed)
+                    .context("Failed to decompress gzip chunk")?;
+                decompressed
+            }
+            COMPRESSION_TYPE_NONE => payload.to_vec(),
+            COMPRESSION_TYPE_LZ4 => decompress_lz4_block_stream(payload)?,
             EXTERNAL_FILE_COMPRESSION_TYPE => {
                 let external_path = source_dir.join(format!("c.{}.{}.mcc", chunk_x, chunk_z));
                 let external_mmap = io_utils::mmap_file(&external_path).with_context(|| {
@@ -198,7 +282,12 @@ pub fn read_anvil_region<P: AsRef<Path>>(
                 decompressed
             }
             _ => {
-                return Err(RegionError::InvalidFormat.into());
+                return Err(RegionError::UnsupportedCompression {
+                    compression_type: header.compression_type,
+                    x: chunk_x,
+                    z: chunk_z,
+                }
+                .into());
             }
         };
 
