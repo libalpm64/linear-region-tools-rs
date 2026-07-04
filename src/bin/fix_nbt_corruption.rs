@@ -40,6 +40,12 @@ struct Args {
     /// Dry run, do not make changes but see the output.
     #[arg(short, long)]
     dry_run: bool,
+
+    #[arg(long)]
+    delete_custom_data_entities: bool,
+
+    #[arg(long)]
+    clamp_positions: bool,
 }
 
 #[derive(Debug, Default)]
@@ -172,7 +178,7 @@ fn fix_region_file(file_path: &Path, args: &Args) -> Result<FixStats> {
     let mut used_uuids = HashSet::new();
 
     for chunk in region.chunks.values_mut() {
-        let chunk_stats = fix_chunk(chunk, &mut used_uuids)?;
+        let chunk_stats = fix_chunk(chunk, &mut used_uuids, args)?;
 
         if chunk_stats.entities_fixed > 0
             || chunk_stats.enchantments_fixed > 0
@@ -234,7 +240,7 @@ fn should_delete_entity(entity: &Value) -> bool {
     false
 }
 
-fn fix_chunk(chunk: &mut Chunk, used_uuids: &mut HashSet<String>) -> Result<FixStats> {
+fn fix_chunk(chunk: &mut Chunk, used_uuids: &mut HashSet<String>, args: &Args) -> Result<FixStats> {
     let mut stats = FixStats::default();
 
     let mut nbt = chunk.parse_nbt()?;
@@ -243,17 +249,19 @@ fn fix_chunk(chunk: &mut Chunk, used_uuids: &mut HashSet<String>) -> Result<FixS
     if let Value::Compound(compound) = &mut nbt {
         for entities_field in ["Entities", "entities"] {
             if let Some(Value::List(entities)) = compound.get_mut(entities_field) {
-                let original_count = entities.len();
-                entities.retain(|entity| !should_delete_entity(entity));
+                if args.delete_custom_data_entities {
+                    let original_count = entities.len();
+                    entities.retain(|entity| !should_delete_entity(entity));
 
-                let deleted_count = original_count - entities.len();
-                if deleted_count > 0 {
-                    stats.entities_fixed += deleted_count;
-                    modified = true;
+                    let deleted_count = original_count - entities.len();
+                    if deleted_count > 0 {
+                        stats.entities_fixed += deleted_count;
+                        modified = true;
+                    }
                 }
 
                 for entity in entities {
-                    let entity_stats = fix_entity(entity, chunk.x, chunk.z, used_uuids)?;
+                    let entity_stats = fix_entity(entity, chunk.x, chunk.z, used_uuids, args)?;
                     if entity_stats.entities_fixed > 0
                         || entity_stats.enchantments_fixed > 0
                         || entity_stats.uuids_regenerated > 0
@@ -279,6 +287,7 @@ fn fix_entity(
     chunk_x: i32,
     chunk_z: i32,
     used_uuids: &mut HashSet<String>,
+    args: &Args,
 ) -> Result<FixStats> {
     let mut stats = FixStats::default();
 
@@ -311,17 +320,19 @@ fn fix_entity(
             }
         }
 
-        if let Some(pos) = entity_data.get_mut("Pos") {
-            let pos_stats = fix_entity_position(pos, chunk_x, chunk_z)?;
-            stats.merge(&pos_stats);
-            if pos_stats.positions_fixed > 0 {
-                entity_modified = true;
+        if args.clamp_positions {
+            if let Some(pos) = entity_data.get_mut("Pos") {
+                let pos_stats = fix_entity_position(pos, chunk_x, chunk_z)?;
+                stats.merge(&pos_stats);
+                if pos_stats.positions_fixed > 0 {
+                    entity_modified = true;
+                }
             }
         }
 
         if let Some(Value::List(passengers)) = entity_data.get_mut("Passengers") {
             for passenger in passengers {
-                let passenger_stats = fix_entity(passenger, chunk_x, chunk_z, used_uuids)?;
+                let passenger_stats = fix_entity(passenger, chunk_x, chunk_z, used_uuids, args)?;
                 stats.merge(&passenger_stats);
                 if passenger_stats.entities_fixed > 0
                     || passenger_stats.enchantments_fixed > 0
@@ -457,10 +468,10 @@ fn fix_entity_uuid(uuid_value: &mut Value, used_uuids: &mut HashSet<String>) -> 
         Value::String(s) => s.clone(),
         Value::IntArray(arr) if arr.len() == 4 => {
             let uuid = Uuid::from_u128(
-                ((arr[0] as u128) << 96)
-                    | ((arr[1] as u128) << 64)
-                    | ((arr[2] as u128) << 32)
-                    | (arr[3] as u128),
+                ((arr[0] as u32 as u128) << 96)
+                    | ((arr[1] as u32 as u128) << 64)
+                    | ((arr[2] as u32 as u128) << 32)
+                    | (arr[3] as u32 as u128),
             );
             uuid.to_string()
         }

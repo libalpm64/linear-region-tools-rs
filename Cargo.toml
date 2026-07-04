@@ -57,3 +57,4 @@ smallvec = "1.15.1"
 ahash = "0.8.12"
 filetime = "0.2.26"
 uuid = { version = "1.11.0", features = ["v4"] }
+lz4_flex = "0.11"
