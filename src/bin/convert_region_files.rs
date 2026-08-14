@@ -199,11 +199,13 @@ fn main() -> Result<()> {
     let mut source_files = Vec::new();
     for entry in fs::read_dir(&args.source_dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() {
+        let filename = entry.file_name().to_string_lossy().to_string();
+        if !is_valid_source_file(&args.conversion_mode, &filename) {
             continue;
         }
-        let filename = entry.file_name().to_string_lossy().to_string();
-        if is_valid_source_file(&args.conversion_mode, &filename) {
+
+        let file_type = entry.file_type()?;
+        if file_type.is_file() || file_type.is_symlink() {
             source_files.push(entry);
         }
     }
