@@ -1,64 +1,51 @@
 use crate::{
-    io_utils, Chunk, PerformanceCounters, Region, RegionError, CHUNKS_PER_REGION, LINEAR_SIGNATURE,
-    LINEAR_VERSION_V1, LINEAR_VERSION_V2, REGION_DIMENSION,
+    CHUNKS_PER_REGION, Chunk, LINEAR_SIGNATURE, LINEAR_VERSION, PerformanceCounters,
+    REGION_DIMENSION, Region, RegionError, io_utils,
 };
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
 use zstd;
 
-#[derive(Debug, Clone, Copy)]
-pub enum LinearVersion {
-    V1,
-    V2,
+fn decompress_linear(compressed_data: &[u8]) -> Result<Vec<u8>> {
+    zstd::stream::decode_all(compressed_data).map_err(|e| {
+        RegionError::DecompressionFailed {
+            reason: format!("Linear decompression failed: {e}"),
+        }
+        .into()
+    })
 }
 
-impl LinearVersion {
-    fn as_u8(&self) -> u8 {
-        match self {
-            LinearVersion::V1 => LINEAR_VERSION_V1,
-            LinearVersion::V2 => LINEAR_VERSION_V2,
+fn validate_chunk_size(size: usize, x: i32, z: i32) -> Result<u32> {
+    if size > crate::MAX_LINEAR_CHUNK_SIZE {
+        return Err(RegionError::ChunkTooLarge {
+            x,
+            z,
+            size,
+            max: crate::MAX_LINEAR_CHUNK_SIZE,
         }
+        .into());
     }
+    u32::try_from(size).map_err(|_| {
+        RegionError::ChunkTooLarge {
+            x,
+            z,
+            size,
+            max: u32::MAX as usize,
+        }
+        .into()
+    })
 }
 
-fn decompress_with_retry(compressed_data: &[u8], header: &LinearHeader) -> Result<Vec<u8>> {
-    match zstd::bulk::decompress(compressed_data, 0) {
-        Ok(data) => return Ok(data),
-        Err(_) => {}
-    }
-
-    match zstd::bulk::decompress(compressed_data, 64 * 1024 * 1024) {
-        Ok(data) => return Ok(data),
-        Err(_) => {}
-    }
-
-    let estimated_size = (header.chunk_count as usize) * 1024 * 16;
-    match zstd::bulk::decompress(compressed_data, estimated_size) {
-        Ok(data) => return Ok(data),
-        Err(_) => {}
-    }
-
-    match zstd::stream::Decoder::new(compressed_data) {
-        Ok(mut decoder) => {
-            let mut decompressed = Vec::new();
-            match std::io::copy(&mut decoder, &mut decompressed) {
-                Ok(_) => return Ok(decompressed),
-                Err(e) => {
-                    return Err(RegionError::DecompressionFailed {
-                        reason: format!("Streaming decompression failed: {}", e),
-                    }
-                    .into())
-                }
-            }
+fn validate_compressed_region_size(size: usize) -> Result<u32> {
+    if size > i32::MAX as usize {
+        return Err(RegionError::LinearRegionTooLarge {
+            size,
+            max: i32::MAX as usize,
         }
-        Err(e) => {
-            return Err(RegionError::DecompressionFailed {
-                reason: format!("Streaming decoder creation failed: {}", e),
-            }
-            .into())
-        }
+        .into());
     }
+    Ok(size as u32)
 }
 
 #[repr(C, packed)]
@@ -80,11 +67,10 @@ impl LinearHeader {
         compression_level: i8,
         chunk_count: u16,
         compressed_size: u32,
-        version: LinearVersion,
     ) -> Self {
         Self {
             signature: LINEAR_SIGNATURE,
-            version: version.as_u8(),
+            version: LINEAR_VERSION,
             newest_timestamp,
             compression_level,
             chunk_count,
@@ -118,7 +104,7 @@ impl LinearHeader {
         })
     }
 
-    fn to_bytes(&self) -> [u8; Self::SIZE] {
+    fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut bytes = [0u8; Self::SIZE];
         bytes[0..8].copy_from_slice(&self.signature.to_be_bytes());
         bytes[8] = self.version;
@@ -146,7 +132,7 @@ impl ChunkMeta {
         Self { size, timestamp }
     }
 
-    fn to_bytes(&self) -> [u8; Self::SIZE] {
+    fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut bytes = [0u8; Self::SIZE];
         bytes[0..4].copy_from_slice(&self.size.to_be_bytes());
         bytes[4..8].copy_from_slice(&self.timestamp.to_be_bytes());
@@ -194,7 +180,23 @@ pub fn read_linear_region<P: AsRef<Path>>(
         .into());
     }
 
-    let footer_start = file_size - 8;
+    if header.compressed_size > i32::MAX as u32 {
+        return Err(RegionError::LinearRegionTooLarge {
+            size: header.compressed_size as usize,
+            max: i32::MAX as usize,
+        }
+        .into());
+    }
+
+    let compressed_start = LinearHeader::SIZE + 8;
+    let compressed_end = compressed_start
+        .checked_add(header.compressed_size as usize)
+        .ok_or(RegionError::InvalidFormat)?;
+    if compressed_end.checked_add(8) != Some(file_size) {
+        return Err(RegionError::InvalidFormat.into());
+    }
+
+    let footer_start = compressed_end;
     let footer_signature = u64::from_be_bytes([
         mmap[footer_start],
         mmap[footer_start + 1],
@@ -214,10 +216,8 @@ pub fn read_linear_region<P: AsRef<Path>>(
         .into());
     }
 
-    let compressed_start = LinearHeader::SIZE + 8;
-    let compressed_end = footer_start;
     let compressed_data = &mmap[compressed_start..compressed_end];
-    let decompressed = decompress_with_retry(compressed_data, &header)?;
+    let decompressed = decompress_linear(compressed_data)?;
 
     let expected_header_size = CHUNKS_PER_REGION * ChunkMeta::SIZE;
     if decompressed.len() < expected_header_size {
@@ -232,10 +232,25 @@ pub fn read_linear_region<P: AsRef<Path>>(
         let meta_start = i * ChunkMeta::SIZE;
         let meta_end = meta_start + ChunkMeta::SIZE;
         let meta = ChunkMeta::from_bytes(&decompressed[meta_start..meta_end]);
+        let meta_size = meta.size;
 
-        if meta.size > 0 {
+        if meta_size > i32::MAX as u32 {
+            let x = region_x * REGION_DIMENSION as i32 + (i % REGION_DIMENSION) as i32;
+            let z = region_z * REGION_DIMENSION as i32 + (i / REGION_DIMENSION) as i32;
+            return Err(RegionError::ChunkTooLarge {
+                x,
+                z,
+                size: meta_size as usize,
+                max: i32::MAX as usize,
+            }
+            .into());
+        }
+
+        if meta_size > 0 {
             real_chunk_count += 1;
-            total_chunk_size += meta.size as usize;
+            total_chunk_size = total_chunk_size
+                .checked_add(meta_size as usize)
+                .ok_or(RegionError::InvalidFormat)?;
         }
 
         chunk_metas.push(meta);
@@ -249,7 +264,7 @@ pub fn read_linear_region<P: AsRef<Path>>(
         .into());
     }
 
-    if expected_header_size + total_chunk_size != decompressed.len() {
+    if expected_header_size.checked_add(total_chunk_size) != Some(decompressed.len()) {
         return Err(RegionError::InvalidFormat.into());
     }
 
@@ -291,7 +306,6 @@ pub fn write_linear_region<P: AsRef<Path>>(
     path: P,
     region: &Region,
     compression_level: i32,
-    version: LinearVersion,
     counters: Option<Arc<PerformanceCounters>>,
 ) -> Result<()> {
     let path = path.as_ref();
@@ -303,7 +317,8 @@ pub fn write_linear_region<P: AsRef<Path>>(
 
     for i in 0..CHUNKS_PER_REGION {
         if let Some(chunk) = region.get_chunk(i) {
-            let size = chunk.size() as u32;
+            let raw_size = chunk.size();
+            let size = validate_chunk_size(raw_size, chunk.x, chunk.z)?;
             let timestamp = region.timestamps[i];
 
             chunk_metas.push(ChunkMeta { size, timestamp });
@@ -334,12 +349,13 @@ pub fn write_linear_region<P: AsRef<Path>>(
         }
     })?;
 
+    let compressed_size = validate_compressed_region_size(compressed.len())?;
+
     let header = LinearHeader::new(
         newest_timestamp as u64,
         compression_level as i8,
         chunk_count,
-        compressed.len() as u32,
-        version,
+        compressed_size,
     );
 
     let mut file_data = Vec::with_capacity(LinearHeader::SIZE + 8 + compressed.len() + 8);
@@ -365,33 +381,5 @@ pub fn write_linear_region<P: AsRef<Path>>(
 }
 
 pub fn verify_linear_file<P: AsRef<Path>>(path: P) -> bool {
-    let Ok(mmap) = io_utils::mmap_file(path) else {
-        return false;
-    };
-
-    if mmap.len() < LinearHeader::SIZE + 8 {
-        return false;
-    }
-
-    let Ok(header) = LinearHeader::from_bytes(&mmap[..LinearHeader::SIZE]) else {
-        return false;
-    };
-
-    if header.signature != LINEAR_SIGNATURE || (header.version != 1 && header.version != 2) {
-        return false;
-    }
-
-    let footer_start = mmap.len() - 8;
-    let footer_signature = u64::from_be_bytes([
-        mmap[footer_start],
-        mmap[footer_start + 1],
-        mmap[footer_start + 2],
-        mmap[footer_start + 3],
-        mmap[footer_start + 4],
-        mmap[footer_start + 5],
-        mmap[footer_start + 6],
-        mmap[footer_start + 7],
-    ]);
-
-    footer_signature == LINEAR_SIGNATURE
+    read_linear_region(path, None).is_ok()
 }

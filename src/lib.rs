@@ -17,8 +17,9 @@ pub const REGION_DIMENSION: usize = 32;
 pub const CHUNKS_PER_REGION: usize = REGION_DIMENSION * REGION_DIMENSION;
 pub const SECTOR_SIZE: usize = 4096;
 pub const LINEAR_SIGNATURE: u64 = 0xc3ff13183cca9d9a;
-pub const LINEAR_VERSION_V1: u8 = 1;
-pub const LINEAR_VERSION_V2: u8 = 2;
+pub const LINEAR_VERSION: u8 = 1;
+/// The Java reader uses a signed `int` for each legacy Linear chunk length.
+pub const MAX_LINEAR_CHUNK_SIZE: usize = i32::MAX as usize;
 pub const COMPRESSION_TYPE_GZIP: u8 = 1;
 pub const COMPRESSION_TYPE_ZLIB: u8 = 2;
 pub const COMPRESSION_TYPE_NONE: u8 = 3;
@@ -50,7 +51,27 @@ pub enum RegionError {
     InvalidFormat,
 
     #[error("Unsupported chunk compression type {compression_type} at chunk ({x}, {z})")]
-    UnsupportedCompression { compression_type: u8, x: i32, z: i32 },
+    UnsupportedCompression {
+        compression_type: u8,
+        x: i32,
+        z: i32,
+    },
+
+    #[error("Invalid Anvil chunk at ({x}, {z}): {reason}")]
+    InvalidAnvilChunk { x: i32, z: i32, reason: String },
+
+    #[error("Chunk ({x}, {z}) is {size} bytes, exceeding the safe Linear limit of {max} bytes")]
+    ChunkTooLarge {
+        x: i32,
+        z: i32,
+        size: usize,
+        max: usize,
+    },
+
+    #[error(
+        "Compressed Linear region is {size} bytes, exceeding the signed 32-bit format limit of {max} bytes"
+    )]
+    LinearRegionTooLarge { size: usize, max: usize },
 }
 
 #[derive(Clone)]

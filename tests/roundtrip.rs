@@ -1,7 +1,7 @@
 use linear_region_tools::{
-    anvil::{read_anvil_region, write_anvil_region},
-    linear::{read_linear_region, write_linear_region, LinearVersion},
     Chunk, Region,
+    anvil::{read_anvil_region, write_anvil_region},
+    linear::{read_linear_region, write_linear_region},
 };
 
 fn fake_nbt_chunk(x: i32, z: i32) -> Chunk {
@@ -32,14 +32,18 @@ fn mca_linear_roundtrip() {
     assert_eq!(from_mca.chunk_count(), 3);
     assert_eq!(from_mca.timestamps.len(), 1024);
 
-    write_linear_region(&linear_path, &from_mca, 6, LinearVersion::V1, None).unwrap();
+    write_linear_region(&linear_path, &from_mca, 6, None).unwrap();
     let from_linear = read_linear_region(&linear_path, None).unwrap();
     assert_eq!(from_linear.chunk_count(), 3);
 
     for &(x, z) in &[(-32, 64), (-17, 70), (-1, 95)] {
         let orig = region.get_chunk_at(x, z).unwrap();
         let round = from_linear.get_chunk_at(x, z).unwrap();
-        assert_eq!(orig.as_slice(), round.as_slice(), "chunk ({x},{z}) data mismatch");
+        assert_eq!(
+            orig.as_slice(),
+            round.as_slice(),
+            "chunk ({x},{z}) data mismatch"
+        );
         let idx = ((z & 31) as usize) * 32 + ((x & 31) as usize);
         assert_eq!(from_linear.timestamps[idx], 12345);
     }

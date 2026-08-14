@@ -1,17 +1,19 @@
 use crate::{
-    io_utils, Chunk, PerformanceCounters, Region, RegionError, CHUNKS_PER_REGION,
-    COMPRESSION_TYPE_GZIP, COMPRESSION_TYPE_LZ4, COMPRESSION_TYPE_NONE, COMPRESSION_TYPE_ZLIB,
-    EXTERNAL_FILE_COMPRESSION_TYPE, REGION_DIMENSION, SECTOR_SIZE,
+    CHUNKS_PER_REGION, COMPRESSION_TYPE_GZIP, COMPRESSION_TYPE_LZ4, COMPRESSION_TYPE_NONE,
+    COMPRESSION_TYPE_ZLIB, Chunk, EXTERNAL_FILE_COMPRESSION_TYPE, PerformanceCounters,
+    REGION_DIMENSION, Region, RegionError, SECTOR_SIZE, io_utils,
 };
 use anyhow::{Context, Result};
 use flate2::{
+    Compression,
     read::{GzDecoder, ZlibDecoder},
     write::ZlibEncoder,
-    Compression,
 };
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
+
+const EXTERNAL_STREAM_FLAG: u8 = 0x80;
 
 /// Anvil chunk location entry (4 bytes)
 #[repr(C, packed)]
@@ -39,7 +41,7 @@ impl ChunkLocation {
         }
     }
 
-    fn to_bytes(&self) -> [u8; Self::SIZE] {
+    fn to_bytes(self) -> [u8; Self::SIZE] {
         [
             self.offset[0],
             self.offset[1],
@@ -84,7 +86,7 @@ impl ChunkDataHeader {
         }
     }
 
-    fn to_bytes(&self) -> [u8; Self::SIZE] {
+    fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut bytes = [0u8; Self::SIZE];
         bytes[0..4].copy_from_slice(&self.length.to_be_bytes());
         bytes[4] = self.compression_type;
@@ -120,8 +122,7 @@ fn decompress_lz4_block_stream(mut data: &[u8]) -> Result<Vec<u8>> {
             return Ok(out);
         }
         let token = data[8];
-        let compressed_len =
-            u32::from_le_bytes([data[9], data[10], data[11], data[12]]) as usize;
+        let compressed_len = u32::from_le_bytes([data[9], data[10], data[11], data[12]]) as usize;
         let decompressed_len =
             u32::from_le_bytes([data[13], data[14], data[15], data[16]]) as usize;
 
@@ -139,9 +140,11 @@ fn decompress_lz4_block_stream(mut data: &[u8]) -> Result<Vec<u8>> {
         match token & 0xf0 {
             METHOD_RAW => out.extend_from_slice(payload),
             METHOD_LZ4 => {
-                let decompressed = lz4_flex::block::decompress(payload, decompressed_len)
-                    .map_err(|e| RegionError::DecompressionFailed {
-                        reason: format!("LZ4 block decompression failed: {}", e),
+                let decompressed =
+                    lz4_flex::block::decompress(payload, decompressed_len).map_err(|e| {
+                        RegionError::DecompressionFailed {
+                            reason: format!("LZ4 block decompression failed: {}", e),
+                        }
                     })?;
                 out.extend_from_slice(&decompressed);
             }
@@ -149,10 +152,44 @@ fn decompress_lz4_block_stream(mut data: &[u8]) -> Result<Vec<u8>> {
                 return Err(RegionError::DecompressionFailed {
                     reason: format!("Unknown LZ4 block method: {:#x}", method),
                 }
-                .into())
+                .into());
             }
         }
         data = &data[HEADER_LEN + compressed_len..];
+    }
+}
+
+fn decompress_chunk_payload(
+    compression_type: u8,
+    payload: &[u8],
+    chunk_x: i32,
+    chunk_z: i32,
+) -> Result<Vec<u8>> {
+    match compression_type {
+        COMPRESSION_TYPE_ZLIB => {
+            let mut decoder = ZlibDecoder::new(payload);
+            let mut decompressed = Vec::new();
+            decoder
+                .read_to_end(&mut decompressed)
+                .context("Failed to decompress zlib chunk")?;
+            Ok(decompressed)
+        }
+        COMPRESSION_TYPE_GZIP => {
+            let mut decoder = GzDecoder::new(payload);
+            let mut decompressed = Vec::new();
+            decoder
+                .read_to_end(&mut decompressed)
+                .context("Failed to decompress gzip chunk")?;
+            Ok(decompressed)
+        }
+        COMPRESSION_TYPE_NONE => Ok(payload.to_vec()),
+        COMPRESSION_TYPE_LZ4 => decompress_lz4_block_stream(payload),
+        _ => Err(RegionError::UnsupportedCompression {
+            compression_type,
+            x: chunk_x,
+            z: chunk_z,
+        }
+        .into()),
     }
 }
 
@@ -213,82 +250,155 @@ pub fn read_anvil_region<P: AsRef<Path>>(
 
     let mut chunks_loaded = 0u64;
     for (i, location) in chunk_locations.iter().enumerate() {
+        let chunk_x = region_x * REGION_DIMENSION as i32 + (i % REGION_DIMENSION) as i32;
+        let chunk_z = region_z * REGION_DIMENSION as i32 + (i / REGION_DIMENSION) as i32;
+
         if location.is_empty() {
             continue;
         }
 
         let sector_offset = location.get_offset() as usize;
-        let sector_count = location.sector_count as usize;
+        let mut sector_count = location.sector_count as usize;
 
-        if sector_offset == 0 || sector_count == 0 {
-            continue;
+        if sector_offset < 2 || sector_count == 0 {
+            return Err(RegionError::InvalidAnvilChunk {
+                x: chunk_x,
+                z: chunk_z,
+                reason: format!(
+                    "invalid location entry (sector offset {sector_offset}, count {sector_count})"
+                ),
+            }
+            .into());
         }
 
-        let chunk_start = sector_offset * SECTOR_SIZE;
-        let chunk_end = chunk_start + sector_count * SECTOR_SIZE;
+        let chunk_start = sector_offset.checked_mul(SECTOR_SIZE).ok_or_else(|| {
+            RegionError::InvalidAnvilChunk {
+                x: chunk_x,
+                z: chunk_z,
+                reason: "sector offset overflows the address space".to_string(),
+            }
+        })?;
+        // Spigot/Forge use 255 as a sentinel when a local chunk occupies more
+        // sectors than the one-byte location entry can represent. The actual
+        // allocation must be recovered from the chunk's declared byte length.
+        if sector_count == u8::MAX as usize {
+            let length_end =
+                chunk_start
+                    .checked_add(4)
+                    .ok_or_else(|| RegionError::InvalidAnvilChunk {
+                        x: chunk_x,
+                        z: chunk_z,
+                        reason: "oversized chunk header overflows the address space".to_string(),
+                    })?;
+            if length_end > file_size {
+                return Err(RegionError::InvalidAnvilChunk {
+                    x: chunk_x,
+                    z: chunk_z,
+                    reason: "oversized chunk is missing its real length header".to_string(),
+                }
+                .into());
+            }
+            let declared_length = u32::from_be_bytes([
+                mmap[chunk_start],
+                mmap[chunk_start + 1],
+                mmap[chunk_start + 2],
+                mmap[chunk_start + 3],
+            ]) as usize;
+            let stored_size =
+                declared_length
+                    .checked_add(4)
+                    .ok_or_else(|| RegionError::InvalidAnvilChunk {
+                        x: chunk_x,
+                        z: chunk_z,
+                        reason: "oversized chunk length overflows the address space".to_string(),
+                    })?;
+            sector_count = stored_size.div_ceil(SECTOR_SIZE);
+        }
+
+        let chunk_end = sector_count
+            .checked_mul(SECTOR_SIZE)
+            .and_then(|length| chunk_start.checked_add(length))
+            .ok_or_else(|| RegionError::InvalidAnvilChunk {
+                x: chunk_x,
+                z: chunk_z,
+                reason: "sector range overflows the address space".to_string(),
+            })?;
 
         if chunk_end > file_size {
-            continue;
+            return Err(RegionError::InvalidAnvilChunk {
+                x: chunk_x,
+                z: chunk_z,
+                reason: format!(
+                    "sector range ends at byte {chunk_end}, beyond file size {file_size}"
+                ),
+            }
+            .into());
         }
 
         let chunk_data = &mmap[chunk_start..chunk_end];
 
         if chunk_data.len() < ChunkDataHeader::SIZE {
-            continue;
+            return Err(RegionError::InvalidAnvilChunk {
+                x: chunk_x,
+                z: chunk_z,
+                reason: "chunk sector is shorter than its 5-byte header".to_string(),
+            }
+            .into());
         }
 
         let header = ChunkDataHeader::from_bytes(&chunk_data[..ChunkDataHeader::SIZE]);
+        let declared_length = header.length;
+        let stored_compression_type = header.compression_type;
         let compressed_data = &chunk_data[ChunkDataHeader::SIZE..];
 
-        let chunk_x = region_x * REGION_DIMENSION as i32 + (i % REGION_DIMENSION) as i32;
-        let chunk_z = region_z * REGION_DIMENSION as i32 + (i / REGION_DIMENSION) as i32;
-
-        let data_length = std::cmp::min(
-            (header.length as usize).saturating_sub(1),
-            compressed_data.len(),
-        );
-        let payload = &compressed_data[..data_length];
-
-        let nbt_data = match header.compression_type {
-            COMPRESSION_TYPE_ZLIB => {
-                let mut decoder = ZlibDecoder::new(payload);
-                let mut decompressed = Vec::new();
-                decoder
-                    .read_to_end(&mut decompressed)
-                    .context("Failed to decompress zlib chunk")?;
-                decompressed
+        if declared_length == 0 {
+            return Err(RegionError::InvalidAnvilChunk {
+                x: chunk_x,
+                z: chunk_z,
+                reason: "declared chunk length is zero".to_string(),
             }
-            COMPRESSION_TYPE_GZIP => {
-                let mut decoder = GzDecoder::new(payload);
-                let mut decompressed = Vec::new();
-                decoder
-                    .read_to_end(&mut decompressed)
-                    .context("Failed to decompress gzip chunk")?;
-                decompressed
-            }
-            COMPRESSION_TYPE_NONE => payload.to_vec(),
-            COMPRESSION_TYPE_LZ4 => decompress_lz4_block_stream(payload)?,
-            EXTERNAL_FILE_COMPRESSION_TYPE => {
-                let external_path = source_dir.join(format!("c.{}.{}.mcc", chunk_x, chunk_z));
-                let external_mmap = io_utils::mmap_file(&external_path).with_context(|| {
-                    format!("Failed to read external file: {:?}", external_path)
-                })?;
+            .into());
+        }
 
-                let mut decoder = ZlibDecoder::new(&external_mmap[..]);
-                let mut decompressed = Vec::new();
-                decoder
-                    .read_to_end(&mut decompressed)
-                    .context("Failed to decompress external chunk")?;
-                decompressed
-            }
-            _ => {
-                return Err(RegionError::UnsupportedCompression {
-                    compression_type: header.compression_type,
+        let is_external = stored_compression_type & EXTERNAL_STREAM_FLAG != 0;
+        let compression_type = stored_compression_type & !EXTERNAL_STREAM_FLAG;
+
+        let nbt_data = if is_external {
+            if declared_length != 1 {
+                return Err(RegionError::InvalidAnvilChunk {
                     x: chunk_x,
                     z: chunk_z,
+                    reason: format!(
+                        "external chunk header has length {}, expected 1",
+                        declared_length
+                    ),
                 }
                 .into());
             }
+            let external_path = source_dir.join(format!("c.{}.{}.mcc", chunk_x, chunk_z));
+            let external_mmap = io_utils::mmap_file(&external_path).with_context(|| {
+                format!("Failed to read external chunk {}", external_path.display())
+            })?;
+            decompress_chunk_payload(compression_type, &external_mmap, chunk_x, chunk_z)?
+        } else {
+            let data_length = (declared_length - 1) as usize;
+            if data_length > compressed_data.len() {
+                return Err(RegionError::InvalidAnvilChunk {
+                    x: chunk_x,
+                    z: chunk_z,
+                    reason: format!(
+                        "declares {data_length} payload bytes, but only {} fit in its sectors",
+                        compressed_data.len()
+                    ),
+                }
+                .into());
+            }
+            decompress_chunk_payload(
+                compression_type,
+                &compressed_data[..data_length],
+                chunk_x,
+                chunk_z,
+            )?
         };
 
         let chunk = Chunk::new(nbt_data, chunk_x, chunk_z);
@@ -326,7 +436,7 @@ pub fn write_anvil_region<P: AsRef<Path>>(
             let compressed = encoder.finish().context("Failed to compress chunk data")?;
 
             let data_size = ChunkDataHeader::SIZE + compressed.len();
-            let sectors_needed = (data_size + SECTOR_SIZE - 1) / SECTOR_SIZE;
+            let sectors_needed = data_size.div_ceil(SECTOR_SIZE);
 
             if sectors_needed > 255 {
                 let chunk_x =
@@ -410,7 +520,7 @@ pub fn region_to_anvil_bytes(region: &Region, compression_level: u32) -> Result<
             let compressed = encoder.finish().context("Failed to compress chunk data")?;
 
             let data_size = ChunkDataHeader::SIZE + compressed.len();
-            let sectors_needed = (data_size + SECTOR_SIZE - 1) / SECTOR_SIZE;
+            let sectors_needed = data_size.div_ceil(SECTOR_SIZE);
 
             if sectors_needed > 255 {
                 return Err(RegionError::InvalidFormat.into());

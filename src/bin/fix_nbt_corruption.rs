@@ -3,9 +3,9 @@ use clap::Parser;
 use fastnbt::Value;
 use indicatif::{ProgressBar, ProgressStyle};
 use linear_region_tools::{
-    anvil::{read_anvil_region, write_anvil_region},
-    linear::{read_linear_region, write_linear_region, LinearVersion},
     Chunk,
+    anvil::{read_anvil_region, write_anvil_region},
+    linear::{read_linear_region, write_linear_region},
 };
 use rayon::prelude::*;
 use std::{
@@ -201,7 +201,7 @@ fn fix_region_file(file_path: &Path, args: &Args) -> Result<FixStats> {
 
         match args.format.as_str() {
             "mca" => write_anvil_region(&output_path, &region, 6, None)?,
-            "linear" => write_linear_region(&output_path, &region, 3, LinearVersion::V1, None)?,
+            "linear" => write_linear_region(&output_path, &region, 3, None)?,
             _ => unreachable!(),
         }
     }
