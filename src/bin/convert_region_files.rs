@@ -2,22 +2,21 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use linear_region_tools::{
+    Region,
     anvil::{read_anvil_region, write_anvil_region},
-    linear::{read_linear_region, write_linear_region, LinearVersion},
+    linear::{read_linear_region, write_linear_region},
 };
 use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum ConversionMode {
-    Mca2linearv1,
-    Linearv12mca,
-    Mca2linearv2,
-    Linearv2mca,
+    Mca2linear,
+    Linear2mca,
 }
 
 #[derive(Parser)]
@@ -66,25 +65,54 @@ impl ConversionStats {
 
 fn get_output_filename(mode: &ConversionMode, source_filename: &str) -> String {
     match mode {
-        ConversionMode::Mca2linearv1 => source_filename.replace(".mca", ".linear"),
-        ConversionMode::Linearv12mca => source_filename.replace(".linear", ".mca"),
-        ConversionMode::Mca2linearv2 => source_filename.replace(".mca", ".linear"),
-        ConversionMode::Linearv2mca => source_filename.replace(".linear", ".mca"),
+        ConversionMode::Mca2linear => source_filename.replace(".mca", ".linear"),
+        ConversionMode::Linear2mca => source_filename.replace(".linear", ".mca"),
     }
 }
 
 fn is_valid_source_file(mode: &ConversionMode, filename: &str) -> bool {
     match mode {
-        ConversionMode::Mca2linearv1 | ConversionMode::Mca2linearv2 => filename.ends_with(".mca"),
-        ConversionMode::Linearv12mca | ConversionMode::Linearv2mca => filename.ends_with(".linear"),
+        ConversionMode::Mca2linear => filename.ends_with(".mca"),
+        ConversionMode::Linear2mca => filename.ends_with(".linear"),
     }
 }
 
-fn get_linear_version(mode: &ConversionMode) -> LinearVersion {
-    match mode {
-        ConversionMode::Mca2linearv1 | ConversionMode::Linearv12mca => LinearVersion::V1,
-        ConversionMode::Mca2linearv2 | ConversionMode::Linearv2mca => LinearVersion::V2,
+fn verify_regions_equal(source: &Region, destination: &Region) -> Result<()> {
+    anyhow::ensure!(
+        source.region_x == destination.region_x && source.region_z == destination.region_z,
+        "region coordinates changed during conversion"
+    );
+
+    for index in 0..1024 {
+        match (source.get_chunk(index), destination.get_chunk(index)) {
+            (Some(source_chunk), Some(destination_chunk)) => {
+                anyhow::ensure!(
+                    source_chunk.as_slice() == destination_chunk.as_slice(),
+                    "chunk ({}, {}) NBT bytes changed during conversion",
+                    source_chunk.x,
+                    source_chunk.z
+                );
+                anyhow::ensure!(
+                    source.timestamps[index] == destination.timestamps[index],
+                    "chunk ({}, {}) timestamp changed during conversion",
+                    source_chunk.x,
+                    source_chunk.z
+                );
+            }
+            (None, None) => {}
+            (Some(chunk), None) => anyhow::bail!(
+                "chunk ({}, {}) is missing from converted output",
+                chunk.x,
+                chunk.z
+            ),
+            (None, Some(chunk)) => anyhow::bail!(
+                "converted output unexpectedly contains chunk ({}, {})",
+                chunk.x,
+                chunk.z
+            ),
+        }
     }
+    Ok(())
 }
 
 fn convert_file(
@@ -96,29 +124,39 @@ fn convert_file(
     verify: bool,
 ) -> Result<()> {
     if skip_existing && dest_path.exists() {
-        return Ok(());
+        if !verify {
+            return Ok(());
+        }
+
+        let (source, destination) = match mode {
+            ConversionMode::Mca2linear => (
+                read_anvil_region(source_path, None)?,
+                read_linear_region(dest_path, None)?,
+            ),
+            ConversionMode::Linear2mca => (
+                read_linear_region(source_path, None)?,
+                read_anvil_region(dest_path, None)?,
+            ),
+        };
+        return verify_regions_equal(&source, &destination);
     }
 
-    let linear_version = get_linear_version(mode);
-
     match mode {
-        ConversionMode::Mca2linearv1 | ConversionMode::Mca2linearv2 => {
+        ConversionMode::Mca2linear => {
             let region = read_anvil_region(source_path, None)?;
+            write_linear_region(dest_path, &region, compression_level, None)?;
             if verify {
-                for i in 0..1024 {
-                    let _ = region.get_chunk(i);
-                }
+                let converted = read_linear_region(dest_path, None)?;
+                verify_regions_equal(&region, &converted)?;
             }
-            write_linear_region(dest_path, &region, compression_level, linear_version, None)?;
         }
-        ConversionMode::Linearv12mca | ConversionMode::Linearv2mca => {
+        ConversionMode::Linear2mca => {
             let region = read_linear_region(source_path, None)?;
-            if verify {
-                for i in 0..1024 {
-                    let _ = region.get_chunk(i);
-                }
-            }
             write_anvil_region(dest_path, &region, compression_level as u32, None)?;
+            if verify {
+                let converted = read_anvil_region(dest_path, None)?;
+                verify_regions_equal(&region, &converted)?;
+            }
         }
     }
 
@@ -128,6 +166,21 @@ fn convert_file(
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    anyhow::ensure!(args.threads > 0, "--threads must be greater than zero");
+    match &args.conversion_mode {
+        ConversionMode::Mca2linear => anyhow::ensure!(
+            (1..=22).contains(&args.compression_level),
+            "Linear Zstd compression level must be between 1 and 22"
+        ),
+        ConversionMode::Linear2mca => anyhow::ensure!(
+            (0..=9).contains(&args.compression_level),
+            "Anvil zlib compression level must be between 0 and 9"
+        ),
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build_global()?;
+
     if !args.source_dir.exists() {
         eprintln!(
             "Source directory does not exist: {}",
@@ -135,16 +188,28 @@ fn main() -> Result<()> {
         );
         std::process::exit(1);
     }
+    anyhow::ensure!(
+        args.source_dir.is_dir(),
+        "Source path is not a directory: {}",
+        args.source_dir.display()
+    );
 
     fs::create_dir_all(&args.destination_dir)?;
 
-    let source_files: Vec<_> = fs::read_dir(&args.source_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let filename = e.file_name().to_string_lossy().to_string();
-            is_valid_source_file(&args.conversion_mode, &filename)
-        })
-        .collect();
+    let mut source_files = Vec::new();
+    for entry in fs::read_dir(&args.source_dir)? {
+        let entry = entry?;
+        let filename = entry.file_name().to_string_lossy().to_string();
+        if !is_valid_source_file(&args.conversion_mode, &filename) {
+            continue;
+        }
+
+        let file_type = entry.file_type()?;
+        if file_type.is_file() || file_type.is_symlink() {
+            source_files.push(entry);
+        }
+    }
+    source_files.sort_by_key(|entry| entry.file_name());
 
     if source_files.is_empty() {
         eprintln!("No source files found");
@@ -202,6 +267,8 @@ fn main() -> Result<()> {
             converted as f64 / duration.as_secs_f64()
         );
     }
+
+    anyhow::ensure!(errors == 0, "conversion failed for {errors} region file(s)");
 
     Ok(())
 }
